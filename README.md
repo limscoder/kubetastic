@@ -1,2 +1,2 @@
 # kubetastic
-personal kubernets playground
+personal kubernetes playground
