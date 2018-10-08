@@ -10,3 +10,9 @@
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+
+# Binaries
+cmd/provision/provision
+
+# Contains private env vars
+provision-davebot.sh
