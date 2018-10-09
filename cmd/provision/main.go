@@ -4,17 +4,21 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
+const instanceStatusRunning = int64(16)
+
 func terminateCluster(svc *ec2.EC2) error {
 	tagKey := "tag-key"
 	tagValue := "k8s-role"
 	statusKey := "instance-state-code"
-	statusValue := "16"
+	statusValue := fmt.Sprintf("%i", instanceStatusRunning)
 	describeResult, err := svc.DescribeInstances(&ec2.DescribeInstancesInput{
 		Filters: []*ec2.Filter{
 			&ec2.Filter{Name: &tagKey, Values: []*string{&tagValue}},
@@ -44,7 +48,7 @@ func terminateCluster(svc *ec2.EC2) error {
 	return err
 }
 
-func masterUp(svc *ec2.EC2) (*string, error) {
+func masterUp(svc *ec2.EC2) (*ec2.Instance, error) {
 	subnetID := os.Getenv("KUBETASTIC_SUBNET_ID")
 	masterSecurityGroup := os.Getenv("KUBETASTIC_MASTER_SECURITY_GROUP")
 	keyName := os.Getenv("KUBETASTIC_KEYPAIR")
@@ -70,17 +74,81 @@ func masterUp(svc *ec2.EC2) (*string, error) {
 		return nil, fmt.Errorf("master failed: %s", err)
 	}
 
-	return masterResult.Instances[0].InstanceId, nil
+	return waitForMasterInit(svc, masterResult.Instances[0])
 }
 
-func nodeUp(svc *ec2.EC2, nodeCount int) ([]*string, error) {
+func waitForMasterInit(svc *ec2.EC2, master *ec2.Instance) (*ec2.Instance, error) {
+	// Wait for vm statusResult
+	for {
+		fmt.Println("waiting for VM ready")
+		statusResult, err := svc.DescribeInstanceStatus(
+			&ec2.DescribeInstanceStatusInput{
+				InstanceIds: []*string{master.InstanceId},
+			})
+		if err != nil {
+			return nil, err
+		}
+
+		isReady := len(statusResult.InstanceStatuses) == 1 && *statusResult.InstanceStatuses[0].InstanceState.Code == instanceStatusRunning
+		if isReady {
+			// re-query to get public ip
+			describeResult, err := svc.DescribeInstances(
+				&ec2.DescribeInstancesInput{
+					InstanceIds: []*string{master.InstanceId},
+				})
+			if err != nil {
+				return nil, err
+			}
+			master = describeResult.Reservations[0].Instances[0]
+
+			// wait for kube master node ready
+			args := []string{
+				"-o", "StrictHostKeyChecking no",
+				"-i",
+				fmt.Sprintf("~/.ssh/%s.pem", os.Getenv("KUBETASTIC_KEYPAIR")),
+				fmt.Sprintf("core@%s", *master.PublicIpAddress),
+				"stat $HOME/.kube/READY"}
+			for {
+				fmt.Println("waiting for master ready", *master.PublicIpAddress)
+				cmd := exec.Command("ssh", args...)
+				if _, err := cmd.CombinedOutput(); err == nil {
+					return master, nil
+				}
+				time.Sleep(10 * time.Second)
+			}
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func joinCmd(master *ec2.Instance) (string, error) {
+	args := []string{
+		"-o", "StrictHostKeyChecking no",
+		"-i",
+		fmt.Sprintf("~/.ssh/%s.pem", os.Getenv("KUBETASTIC_KEYPAIR")),
+		fmt.Sprintf("core@%s", *master.PublicIpAddress),
+		"sudo kubeadm token create --print-join-command"}
+	cmd := exec.Command("ssh", args...)
+	bytes, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	return string(bytes), nil
+}
+
+func nodeUp(svc *ec2.EC2, master *ec2.Instance, nodeCount int) ([]*ec2.Instance, error) {
 	subnetID := os.Getenv("KUBETASTIC_SUBNET_ID")
 	nodeSecurityGroup := os.Getenv("KUBETASTIC_NODE_SECURITY_GROUP")
 	keyName := os.Getenv("KUBETASTIC_KEYPAIR")
 	tagKey := "k8s-role"
 	tagValue := "node"
 	tagResourceType := "instance"
-	userData := nodeData()
+	join, err := joinCmd(master)
+	if err != nil {
+		return nil, err
+	}
+	userData := nodeData(join)
 
 	nodeResult, err := svc.RunInstances(&ec2.RunInstancesInput{
 		ImageId:          aws.String("ami-0a86d340ea7fde077"),
@@ -99,12 +167,12 @@ func nodeUp(svc *ec2.EC2, nodeCount int) ([]*string, error) {
 		return nil, err
 	}
 
-	nodeIDs := make([]*string, nodeCount, nodeCount)
+	nodes := make([]*ec2.Instance, nodeCount, nodeCount)
 	for i := 0; i < nodeCount; i++ {
-		nodeIDs[i] = nodeResult.Instances[i].InstanceId
+		nodes[i] = nodeResult.Instances[i]
 	}
 
-	return nodeIDs, nil
+	return nodes, nil
 }
 
 func clusterUp(sess *session.Session, nodeCount int) error {
@@ -115,19 +183,23 @@ func clusterUp(sess *session.Session, nodeCount int) error {
 		return fmt.Errorf("cluster termination failed: %s", err)
 	}
 
-	_, err = masterUp(svc)
+	master, err := masterUp(svc)
 	if err != nil {
 		return fmt.Errorf("master creation failed: %s", err)
 	}
-	_, err = nodeUp(svc, nodeCount)
+	fmt.Println("master initialized")
+
+	_, err = nodeUp(svc, master, nodeCount)
 	if err != nil {
 		return fmt.Errorf("node creation failed: %s", err)
 	}
+	fmt.Println("nodes initializing...")
 
 	return nil
 }
 
-// Provision kube cluster in ec2
+// super janky kops knockoff
+// Provisions kube cluster in ec2
 func main() {
 	sess, err := session.NewSession()
 	if err != nil {
