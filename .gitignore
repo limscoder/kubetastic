@@ -12,7 +12,8 @@
 *.out
 
 # Binaries
-cmd/provision/provision
+/bin
+/dist
 
 # Contains private env vars
 provision-davebot.sh

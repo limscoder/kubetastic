@@ -1,0 +1,15 @@
+syntax = "proto3";
+package randopb;
+
+message GetRandRequest {
+  required int32 seed = 1;
+  required int32 max = 2;
+}
+
+message GetRandResponse {
+  required int32 value = 1;
+}
+
+service Rando {
+  rpc GetRand(GetRandRequest) returns (GetRandResponse) {}
+}
