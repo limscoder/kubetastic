@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	throttle "github.com/limscoder/grpc-athrottle"
+
 	"github.com/limscoder/kubetastic/pkg/randopb"
 
 	"google.golang.org/grpc"
@@ -30,7 +32,7 @@ var valueHTML = `
 `
 
 func handleRand(writer http.ResponseWriter, req *http.Request, client randopb.RandoClient) {
-	seed := int32(time.Now().Unix())
+	seed := time.Now().UnixNano()
 	value, err := client.GetRand(context.Background(), &randopb.GetRandRequest{Seed: seed, Max: 100})
 	if err != nil {
 		http.Error(writer, fmt.Sprintf("server connection failed: %v", err), http.StatusInternalServerError)
@@ -47,7 +49,16 @@ func handleRand(writer http.ResponseWriter, req *http.Request, client randopb.Ra
 func main() {
 	flag.Parse()
 
-	randoCon, err := grpc.Dial(*serviceAddr, grpc.WithInsecure())
+	logger := newRequestLogger()
+	params := throttle.ThrottleOptions{
+		WindowDuration:  3 * time.Minute,
+		MinRequestCount: 25,
+		MaxRatio:        2.,
+		Callback:        logger.log,
+	}
+	unaryInterceptOpt := grpc.WithUnaryInterceptor(throttle.NewClientUnaryInterceptor(&params))
+
+	randoCon, err := grpc.Dial(*serviceAddr, grpc.WithInsecure(), unaryInterceptOpt)
 	if err != nil {
 		log.Fatalf("failed to connect to server: %v", err)
 	}
